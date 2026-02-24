@@ -249,6 +249,8 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._event_handler: Any = None
+        self._http_runner: Any = None
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -277,6 +279,7 @@ class FeishuChannel(BaseChannel):
         ).register_p2_im_message_receive_v1(
             self._on_message_sync
         ).build()
+        self._event_handler = event_handler
         
         # Create WebSocket client for long connection
         self._ws_client = lark.ws.Client(
@@ -286,6 +289,9 @@ class FeishuChannel(BaseChannel):
             log_level=lark.LogLevel.INFO
         )
         
+        # Start HTTP callback server on port 18790 (for Lark international HTTP callback mode)
+        await self._start_http_server(18790)
+
         # Start WebSocket client in a separate thread with reconnect loop
         def run_ws():
             while self._running:
@@ -295,12 +301,12 @@ class FeishuChannel(BaseChannel):
                     logger.warning("Feishu WebSocket error: {}", e)
                 if self._running:
                     import time; time.sleep(5)
-        
+
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
-        
-        logger.info("Feishu bot started with WebSocket long connection")
-        logger.info("No public IP required - using WebSocket to receive events")
+
+        logger.info("Feishu bot started (WebSocket + HTTP callback on port 18790 /feishu/events)")
+        logger.info("For Lark international: set Request URL to http://<your-host>:18790/feishu/events")
         
         # Keep running until stopped
         while self._running:
@@ -314,7 +320,61 @@ class FeishuChannel(BaseChannel):
                 self._ws_client.stop()
             except Exception as e:
                 logger.warning("Error stopping WebSocket client: {}", e)
+        if self._http_runner:
+            try:
+                await self._http_runner.cleanup()
+            except Exception as e:
+                logger.warning("Error stopping HTTP server: {}", e)
         logger.info("Feishu bot stopped")
+
+    async def _start_http_server(self, port: int) -> None:
+        """Start an aiohttp HTTP server for Lark HTTP callback mode."""
+        try:
+            from aiohttp import web
+
+            event_handler = self._event_handler
+
+            async def handle_feishu_event(request: web.Request) -> web.Response:
+                body = await request.read()
+
+                # Handle URL verification challenge directly (Lark checks this before token auth)
+                try:
+                    data = json.loads(body)
+                    if data.get("type") == "url_verification":
+                        logger.info("Feishu URL verification challenge received")
+                        return web.Response(
+                            text=json.dumps({"challenge": data["challenge"]}),
+                            content_type="application/json",
+                        )
+                except Exception:
+                    pass
+
+                raw_req = lark.RawRequest()
+                raw_req.uri = str(request.url)
+                raw_req.headers = dict(request.headers)
+                raw_req.body = body
+
+                loop = asyncio.get_running_loop()
+                resp: lark.RawResponse = await loop.run_in_executor(
+                    None, event_handler.do, raw_req
+                )
+
+                return web.Response(
+                    body=resp.content or b"{}",
+                    status=resp.status_code or 200,
+                    content_type="application/json",
+                )
+
+            app = web.Application()
+            app.router.add_post("/feishu/events", handle_feishu_event)
+
+            self._http_runner = web.AppRunner(app)
+            await self._http_runner.setup()
+            site = web.TCPSite(self._http_runner, "0.0.0.0", port)
+            await site.start()
+            logger.info("Feishu HTTP callback server listening on :{}/feishu/events", port)
+        except Exception as e:
+            logger.warning("Failed to start Feishu HTTP server: {}", e)
     
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
