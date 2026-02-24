@@ -96,9 +96,7 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
-        self._consolidating: set[str] = set()  # Session keys with consolidation in progress
-        self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
-        self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        self._session_tasks: dict[str, asyncio.Task] = {}  # Per-session processing tasks
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -242,34 +240,48 @@ class AgentLoop:
         return final_content, tools_used, messages
 
     async def run(self) -> None:
-        """Run the agent loop, processing messages from the bus."""
+        """Dispatch inbound messages to per-session processing tasks."""
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
 
         while self._running:
             try:
-                msg = await asyncio.wait_for(
-                    self.bus.consume_inbound(),
-                    timeout=1.0
+                session_key = await asyncio.wait_for(
+                    self.bus.consume_dispatch(),
+                    timeout=1.0,
                 )
-                try:
-                    response = await self._process_message(msg)
-                    if response is not None:
-                        await self.bus.publish_outbound(response)
-                    elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
-                        ))
-                except Exception as e:
-                    logger.error("Error processing message: {}", e)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
+                task = self._session_tasks.get(session_key)
+                if task is None or task.done():
+                    self._session_tasks[session_key] = asyncio.create_task(
+                        self._run_session(session_key)
+                    )
             except asyncio.TimeoutError:
                 continue
+
+    async def _run_session(self, session_key: str) -> None:
+        """Drain and process all queued messages for a single session, sequentially."""
+        q = self.bus.get_session_queue(session_key)
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                break
+            try:
+                response = await self._process_message(msg, session_key=session_key)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+                elif msg.channel == "cli":
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
+                    ))
+            except Exception as e:
+                logger.error("Error processing message: {}", e)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Sorry, I encountered an error: {str(e)}",
+                ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
@@ -284,18 +296,6 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
-
-    def _get_consolidation_lock(self, session_key: str) -> asyncio.Lock:
-        lock = self._consolidation_locks.get(session_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._consolidation_locks[session_key] = lock
-        return lock
-
-    def _prune_consolidation_lock(self, session_key: str, lock: asyncio.Lock) -> None:
-        """Drop lock entry if no longer in use."""
-        if not lock.locked():
-            self._consolidation_locks.pop(session_key, None)
 
     async def _process_message(
         self,
@@ -332,29 +332,22 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
-            lock = self._get_consolidation_lock(session.key)
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
-            finally:
-                self._consolidating.discard(session.key)
-                self._prune_consolidation_lock(session.key, lock)
-
+            snapshot = session.messages[session.last_consolidated:]
+            if snapshot:
+                temp = Session(key=session.key)
+                temp.messages = list(snapshot)
+                try:
+                    if not await self._consolidate_memory(temp, archive_all=True):
+                        return OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="Memory archival failed, session not cleared. Please try again.",
+                        )
+                except Exception:
+                    logger.exception("/new archival failed for {}", session.key)
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="Memory archival failed, session not cleared. Please try again.",
+                    )
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
@@ -363,25 +356,6 @@ class AgentLoop:
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
-
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
-
-            async def _consolidate_and_unlock():
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    self._prune_consolidation_lock(session.key, lock)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -416,6 +390,13 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+
+        # Consolidate synchronously after save so the next message sees a consistent cursor.
+        # Only triggers at memory_window (default 100) messages, so the delay is rare.
+        unconsolidated = len(session.messages) - session.last_consolidated
+        if unconsolidated >= self.memory_window:
+            logger.info("Memory window reached for {}, consolidating", session.key)
+            await self._consolidate_memory(session)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:

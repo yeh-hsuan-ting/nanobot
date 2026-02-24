@@ -9,21 +9,34 @@ class MessageBus:
     """
     Async message bus that decouples chat channels from the agent core.
 
-    Channels push messages to the inbound queue, and the agent processes
-    them and pushes responses to the outbound queue.
+    Channels push messages to per-session inbound queues so that rapid
+    messages from one user queue behind each other, not behind other users.
+    Responses are pushed to a shared outbound queue.
     """
 
     def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        self._session_queues: dict[str, asyncio.Queue[InboundMessage]] = {}
+        self._dispatch: asyncio.Queue[str] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
 
-    async def publish_inbound(self, msg: InboundMessage) -> None:
-        """Publish a message from a channel to the agent."""
-        await self.inbound.put(msg)
+    def _get_or_create_session_queue(self, key: str) -> asyncio.Queue[InboundMessage]:
+        if key not in self._session_queues:
+            self._session_queues[key] = asyncio.Queue()
+        return self._session_queues[key]
 
-    async def consume_inbound(self) -> InboundMessage:
-        """Consume the next inbound message (blocks until available)."""
-        return await self.inbound.get()
+    async def publish_inbound(self, msg: InboundMessage) -> None:
+        """Route an inbound message to its session queue and notify the dispatcher."""
+        key = msg.session_key
+        await self._get_or_create_session_queue(key).put(msg)
+        await self._dispatch.put(key)
+
+    async def consume_dispatch(self) -> str:
+        """Consume the next session key that has a pending inbound message."""
+        return await self._dispatch.get()
+
+    def get_session_queue(self, key: str) -> asyncio.Queue[InboundMessage]:
+        """Get (or create) the inbound queue for a given session."""
+        return self._get_or_create_session_queue(key)
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
@@ -35,8 +48,8 @@ class MessageBus:
 
     @property
     def inbound_size(self) -> int:
-        """Number of pending inbound messages."""
-        return self.inbound.qsize()
+        """Total number of pending inbound messages across all sessions."""
+        return sum(q.qsize() for q in self._session_queues.values())
 
     @property
     def outbound_size(self) -> int:
