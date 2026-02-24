@@ -60,6 +60,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        session_timeout_hours: float = 4.0,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -97,6 +98,7 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._session_tasks: dict[str, asyncio.Task] = {}  # Per-session processing tasks
+        self._session_timeout_hours = session_timeout_hours
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -328,6 +330,18 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+
+        # Auto-reset on inactivity (skip for /new which resets explicitly)
+        if self._session_timeout_hours > 0 and msg.content.strip().lower() != "/new":
+            from datetime import datetime, timedelta
+            idle = datetime.now() - session.updated_at
+            if idle > timedelta(hours=self._session_timeout_hours) and session.messages:
+                logger.info(
+                    "Session {} idle for {:.1f}h (> {}h threshold), auto-resetting",
+                    session.key, idle.total_seconds() / 3600, self._session_timeout_hours,
+                )
+                session.clear()
+                self.sessions.save(session)
 
         # Slash commands
         cmd = msg.content.strip().lower()

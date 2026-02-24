@@ -129,11 +129,27 @@ class MemoryStore:
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
                 self.append_history(entry)
-            if update := args.get("memory_update"):
+            update = args.get("memory_update")
+            if update is not None:
                 if not isinstance(update, str):
-                    update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
-                    self.write_long_term(update)
+                    logger.warning(
+                        "Memory consolidation: memory_update has unexpected type {}, skipping write",
+                        type(update).__name__,
+                    )
+                    update = None
+                elif len(update.strip()) < 10:
+                    logger.warning(
+                        "Memory consolidation: memory_update too short (len={}), skipping write",
+                        len(update.strip()),
+                    )
+                    update = None
+                elif update.strip().startswith(("{", "[")):
+                    logger.warning(
+                        "Memory consolidation: memory_update looks like serialized JSON, skipping write"
+                    )
+                    update = None
+            if update is not None and update != current_memory:
+                self.write_long_term(update)
 
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
