@@ -30,6 +30,9 @@ WORKDIR /app/bridge
 RUN npm install && npm run build
 WORKDIR /app
 
+# Install Google Ads API SDK (for P5 agent access to ads data)
+RUN uv pip install --system --no-cache google-ads lark-oapi
+
 # Create config directory
 RUN mkdir -p /root/.nanobot
 
