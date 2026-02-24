@@ -38,6 +38,12 @@ class MessageBus:
         """Get (or create) the inbound queue for a given session."""
         return self._get_or_create_session_queue(key)
 
+    def drop_session_queue(self, key: str) -> None:
+        """Remove an empty session queue to reclaim memory."""
+        q = self._session_queues.get(key)
+        if q is not None and q.empty():
+            self._session_queues.pop(key, None)
+
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
         await self.outbound.put(msg)

@@ -255,35 +255,40 @@ class AgentLoop:
                 )
                 task = self._session_tasks.get(session_key)
                 if task is None or task.done():
-                    self._session_tasks[session_key] = asyncio.create_task(
-                        self._run_session(session_key)
+                    new_task = asyncio.create_task(self._run_session(session_key))
+                    new_task.add_done_callback(
+                        lambda t, k=session_key: self._session_tasks.pop(k, None)
                     )
+                    self._session_tasks[session_key] = new_task
             except asyncio.TimeoutError:
                 continue
 
     async def _run_session(self, session_key: str) -> None:
         """Drain and process all queued messages for a single session, sequentially."""
         q = self.bus.get_session_queue(session_key)
-        while True:
-            try:
-                msg = await asyncio.wait_for(q.get(), timeout=0.2)
-            except asyncio.TimeoutError:
-                break
-            try:
-                response = await self._process_message(msg, session_key=session_key)
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    break
+                try:
+                    response = await self._process_message(msg, session_key=session_key)
+                    if response is not None:
+                        await self.bus.publish_outbound(response)
+                    elif msg.channel == "cli":
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
+                        ))
+                except Exception as e:
+                    logger.error("Error processing message: {}", e)
                     await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"Sorry, I encountered an error: {str(e)}",
                     ))
-            except Exception as e:
-                logger.error("Error processing message: {}", e)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=f"Sorry, I encountered an error: {str(e)}",
-                ))
+        finally:
+            self.bus.drop_session_queue(session_key)
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
