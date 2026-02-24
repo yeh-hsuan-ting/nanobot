@@ -143,7 +143,8 @@ class MemoryStore:
                         len(update.strip()),
                     )
                     update = None
-                elif update.strip().startswith(("{", "[")):
+                elif (update.strip().startswith("{") and update.strip().endswith("}")) or \
+                        (update.strip().startswith("[") and update.strip().endswith("]")):
                     logger.warning(
                         "Memory consolidation: memory_update looks like serialized JSON, skipping write"
                     )

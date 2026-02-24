@@ -227,7 +227,7 @@ class AgentLoop:
             else:
                 final_content = self._strip_think(response.content)
                 messages = self.context.add_assistant_message(
-                    messages, final_content,
+                    messages, response.content,  # raw, consistent with tool-call branch
                     reasoning_content=response.reasoning_content,
                 )
                 break
@@ -340,6 +340,14 @@ class AgentLoop:
                     "Session {} idle for {:.1f}h (> {}h threshold), auto-resetting",
                     session.key, idle.total_seconds() / 3600, self._session_timeout_hours,
                 )
+                snapshot = session.messages[session.last_consolidated:]
+                if snapshot:
+                    temp = Session(key=session.key)
+                    temp.messages = list(snapshot)
+                    try:
+                        await self._consolidate_memory(temp, archive_all=True)
+                    except Exception:
+                        logger.exception("Auto-reset archival failed for {}, clearing anyway", session.key)
                 session.clear()
                 self.sessions.save(session)
 
