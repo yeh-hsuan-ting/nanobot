@@ -64,6 +64,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        session_timeout_hours: float = 4.0,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -95,6 +96,7 @@ class AgentLoop:
         )
 
         self._running = False
+        self.session_timeout_hours = session_timeout_hours
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -414,6 +416,29 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
+        # Auto-reset inactive sessions
+        if self.session_timeout_hours > 0:
+            from datetime import datetime
+            now = datetime.now()
+            # Make both naive for comparison (both should be local time)
+            last_active = session.updated_at
+            if last_active.tzinfo is not None:
+                last_active = last_active.replace(tzinfo=None)
+            idle_hours = (now - last_active).total_seconds() / 3600
+            if idle_hours >= self.session_timeout_hours:
+                logger.info(
+                    "Session {} inactive for {:.1f}h (threshold {}h), auto-resetting",
+                    key, idle_hours, self.session_timeout_hours,
+                )
+                snapshot = session.messages[session.last_consolidated:]
+                session.clear()
+                self.sessions.save(session)
+                self.sessions.invalidate(session.key)
+                if snapshot:
+                    self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
+                # Re-fetch the cleared session for this turn
+                session = self.sessions.get_or_create(key)
+
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))

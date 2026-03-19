@@ -89,6 +89,16 @@ class MemoryStore:
         return ""
 
     def write_long_term(self, content: str) -> None:
+        if not isinstance(content, str):
+            logger.warning("Memory write skipped: content is not a string (got {})", type(content).__name__)
+            return
+        if len(content) < 10:
+            logger.warning("Memory write skipped: content too short ({} chars)", len(content))
+            return
+        stripped = content.strip()
+        if (stripped.startswith(("{", "[")) and stripped.endswith(("}", "]"))):
+            logger.warning("Memory write skipped: content looks like a JSON blob")
+            return
         self.memory_file.write_text(content, encoding="utf-8")
 
     def append_history(self, entry: str) -> None:
