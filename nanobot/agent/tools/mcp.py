@@ -13,10 +13,24 @@ from nanobot.agent.tools.registry import ToolRegistry
 
 
 def _is_session_dead(exc: BaseException) -> bool:
-    """Return True if exc indicates the MCP session is dead and we should reconnect."""
+    """
+    Return True if exc indicates the MCP session is dead and we should reconnect.
+
+    The MCP SDK (streamable_http transport) can surface session death as several
+    different exception types depending on where the failure occurs:
+
+    1. McpError code 32600 "Session terminated" — server explicitly told us session is gone
+       (happens when server returns HTTP 404 for a known session ID)
+    2. httpx.RemoteProtocolError — TCP connection closed by server mid-response
+    3. httpx.ConnectError — server unreachable (connect refused, DNS fail)
+    4. httpx.HTTPStatusError — server returned 5xx (502 Bad Gateway after restart)
+    5. anyio.ClosedResourceError — anyio stream was closed (transport torn down)
+    6. EOFError — stdio transport EOF
+    7. BaseExceptionGroup — anyio task groups wrap transport errors in ExceptionGroups
+    """
     from mcp.shared.exceptions import McpError
 
-    # McpError with code 32600 = "Session terminated" (server reaped stale session)
+    # McpError with code 32600 = "Session terminated"
     if isinstance(exc, McpError):
         return exc.error.code == 32600 and "terminated" in exc.error.message.lower()
 
@@ -29,6 +43,10 @@ def _is_session_dead(exc: BaseException) -> bool:
     )):
         return True
 
+    # HTTP status errors (502 Bad Gateway during server restart, etc.)
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+
     # Unwrap ExceptionGroups (anyio task groups wrap errors this way)
     if isinstance(exc, BaseExceptionGroup):
         return any(_is_session_dead(sub) for sub in exc.exceptions)
@@ -40,8 +58,8 @@ async def _create_transport_and_session(name: str, cfg):
     """
     Create transport + ClientSession for a given server config.
 
-    Returns (session, cleanup_coro) where cleanup_coro() must be called when
-    the session is no longer needed (closes transport without using AsyncExitStack).
+    Returns (session, local_stack) where local_stack.aclose() must be called
+    when the session is no longer needed. Does NOT use the AgentLoop's stack.
     """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
@@ -59,8 +77,7 @@ async def _create_transport_and_session(name: str, cfg):
         else:
             raise ValueError(f"MCP server '{name}': no command or url configured")
 
-    # We use an AsyncExitStack LOCAL to this function call so the transport lifecycle
-    # can be captured and closed independently of the AgentLoop's stack.
+    # Local stack — lifecycle managed independently of the AgentLoop's stack.
     local_stack = AsyncExitStack()
     await local_stack.__aenter__()
 
@@ -102,7 +119,9 @@ async def _create_transport_and_session(name: str, cfg):
             )
 
         else:
-            raise ValueError(f"MCP server '{name}': unknown transport type '{transport_type}'")
+            raise ValueError(
+                f"MCP server '{name}': unknown transport type '{transport_type}'"
+            )
 
         session = await local_stack.enter_async_context(ClientSession(read, write))
         await session.initialize()
@@ -117,26 +136,26 @@ async def _create_transport_and_session(name: str, cfg):
 class MCPConnectionManager:
     """
     Owns the lifecycle of one MCP server connection. Reconnects transparently
-    on session death (e.g., server restart, stale session reaped, network error).
+    on session death (server restart, stale session reaped, network error).
 
-    The lock ensures that concurrent tool call failures trigger exactly one
-    reconnect — the thundering-herd problem. Coroutines waiting behind the lock
-    see a fresh session and proceed without reconnecting again.
+    The asyncio.Lock ensures that concurrent tool call failures trigger exactly
+    one reconnect. Coroutines waiting behind the lock see a fresh session and
+    proceed without reconnecting again (thundering-herd protection).
     """
 
     def __init__(self, name: str, cfg):
         self._name = name
         self._cfg = cfg
         self._session = None
-        self._local_stack: AsyncExitStack | None = None  # lifecycle of current session
+        self._local_stack: AsyncExitStack | None = None
         self._lock = asyncio.Lock()
 
     async def connect(self, stack: AsyncExitStack) -> None:
         """
         Initial connection — called once from connect_mcp_servers().
 
-        Uses the AgentLoop's AsyncExitStack for the initial session so that
-        normal shutdown (via aclose()) tears it down gracefully.
+        Uses the AgentLoop's AsyncExitStack so that normal shutdown (via aclose())
+        tears it down gracefully without needing special cleanup code.
         """
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.sse import sse_client
@@ -206,19 +225,22 @@ class MCPConnectionManager:
 
     async def reconnect(self) -> None:
         """
-        Tear down dead session, create a fresh one.
+        Tear down dead session, establish a fresh one.
 
         The asyncio.Lock prevents thundering herd: if 3 tools fail simultaneously,
-        only 1 reconnect executes. The other 2 wait, then see a fresh session.
+        only 1 reconnect executes. The other 2 wait behind the lock, see a fresh
+        self._session, and proceed.
         """
         async with self._lock:
-            # Close old local stack if this is a post-initial reconnect
+            # Close the old local stack (if any prior reconnect left one)
             if self._local_stack is not None:
                 try:
                     await self._local_stack.aclose()
                 except Exception as e:
                     logger.debug(
-                        "mcp_reconnect_cleanup_error", server=self._name, error=str(e)
+                        "mcp_reconnect_cleanup_error",
+                        server=self._name,
+                        error=str(e),
                     )
                 self._local_stack = None
 
@@ -236,31 +258,50 @@ class MCPConnectionManager:
         """
         Call a tool. On session death, reconnect once and retry.
 
-        If the retry also fails, let the exception propagate so the caller
-        can log it and return an error string to the LLM.
+        CancelledError from anyio internal cancel scopes is treated as a session-dead
+        condition: when the transport dies, anyio's write stream raises CancelledError
+        from its checkpoint(). We distinguish this from an external cancellation by
+        checking asyncio.current_task().cancelling() — if > 0, we're externally
+        cancelled and re-raise; otherwise treat as session dead.
+
+        If the retry also fails, let the exception propagate so the caller can
+        log and return an error string to the LLM.
         """
         try:
             return await asyncio.wait_for(
                 self._session.call_tool(tool_name, arguments=arguments),
                 timeout=timeout,
             )
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
             raise
+        except asyncio.CancelledError:
+            # If our asyncio task has been externally cancelled (e.g. /stop), re-raise.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise
+            # Otherwise this is an anyio cancel-scope leak from transport death.
+            # Fall through to reconnect below.
+            logger.warning(
+                "mcp_session_dead_cancelled",
+                server=self._name,
+                tool=tool_name,
+            )
         except Exception as exc:
-            if _is_session_dead(exc):
-                logger.warning(
-                    "mcp_session_dead",
-                    server=self._name,
-                    tool=tool_name,
-                    error=str(exc),
-                )
-                await self.reconnect()
-                # Retry once — if this also fails, propagate
-                return await asyncio.wait_for(
-                    self._session.call_tool(tool_name, arguments=arguments),
-                    timeout=timeout,
-                )
-            raise
+            if not _is_session_dead(exc):
+                raise
+            logger.warning(
+                "mcp_session_dead",
+                server=self._name,
+                tool=tool_name,
+                error=str(exc),
+            )
+
+        # Reconnect and retry once
+        await self.reconnect()
+        return await asyncio.wait_for(
+            self._session.call_tool(tool_name, arguments=arguments),
+            timeout=timeout,
+        )
 
 
 class MCPToolWrapper(Tool):
@@ -307,7 +348,6 @@ class MCPToolWrapper(Tool):
             )
             return f"(MCP tool call timed out after {self._tool_timeout}s)"
         except asyncio.CancelledError:
-            # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
             # Re-raise only if our task was externally cancelled (e.g. /stop).
             task = asyncio.current_task()
             if task is not None and task.cancelling() > 0:
@@ -363,10 +403,14 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(manager, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(
+                    manager, name, tool_def, tool_timeout=cfg.tool_timeout
+                )
                 registry.register(wrapper)
                 logger.debug(
-                    "MCP: registered tool '{}' from server '{}'", wrapper.name, name
+                    "MCP: registered tool '{}' from server '{}'",
+                    wrapper.name,
+                    name,
                 )
                 registered_count += 1
                 if enabled_tools:
@@ -388,7 +432,9 @@ async def connect_mcp_servers(
                     )
 
             logger.info(
-                "MCP server '{}': connected, {} tools registered", name, registered_count
+                "MCP server '{}': connected, {} tools registered",
+                name,
+                registered_count,
             )
         except Exception as e:
             logger.error("MCP server '{}': failed to connect: {}", name, e)
