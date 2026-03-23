@@ -16,21 +16,18 @@ def _is_session_dead(exc: BaseException) -> bool:
     """
     Return True if exc indicates the MCP session is dead and we should reconnect.
 
-    The MCP SDK (streamable_http transport) can surface session death as several
-    different exception types depending on where the failure occurs:
-
-    1. McpError code 32600 "Session terminated" — server explicitly told us session is gone
-       (happens when server returns HTTP 404 for a known session ID)
-    2. httpx.RemoteProtocolError — TCP connection closed by server mid-response
-    3. httpx.ConnectError — server unreachable (connect refused, DNS fail)
-    4. httpx.HTTPStatusError — server returned 5xx (502 Bad Gateway after restart)
-    5. anyio.ClosedResourceError — anyio stream was closed (transport torn down)
+    The MCP SDK (streamable_http transport) surfaces session death as:
+    1. McpError code 32600 "Session terminated" — server reaped stale session
+    2. httpx.RemoteProtocolError — TCP closed mid-response
+    3. httpx.ConnectError — server unreachable
+    4. httpx.HTTPStatusError 5xx — e.g. 502 Bad Gateway during server restart
+    5. anyio.ClosedResourceError — anyio stream torn down
     6. EOFError — stdio transport EOF
-    7. BaseExceptionGroup — anyio task groups wrap transport errors in ExceptionGroups
+    7. BaseExceptionGroup — anyio task groups wrap transport errors
     """
     from mcp.shared.exceptions import McpError
 
-    # McpError with code 32600 = "Session terminated"
+    # McpError code 32600 = "Session terminated"
     if isinstance(exc, McpError):
         return exc.error.code == 32600 and "terminated" in exc.error.message.lower()
 
@@ -43,7 +40,7 @@ def _is_session_dead(exc: BaseException) -> bool:
     )):
         return True
 
-    # HTTP status errors (502 Bad Gateway during server restart, etc.)
+    # HTTP 5xx (e.g. 502 Bad Gateway during server restart)
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
 
@@ -54,12 +51,29 @@ def _is_session_dead(exc: BaseException) -> bool:
     return False
 
 
+def _is_anyio_cancel_scope_error(exc: asyncio.CancelledError) -> bool:
+    """
+    Return True if this CancelledError came from an anyio cancel scope
+    (transport teardown), NOT from an external asyncio task.cancel() call.
+
+    When the MCP session's internal anyio task group is cancelled (e.g. because
+    the transport died), it generates a CancelledError with message:
+      "Cancelled via cancel scope <hex_id> by <task_info>"
+
+    External task cancellation (e.g. /stop) uses the standard asyncio mechanism
+    and does NOT produce this message prefix.
+    """
+    if exc.args and isinstance(exc.args[0], str):
+        return exc.args[0].startswith("Cancelled via cancel scope ")
+    return False
+
+
 async def _create_transport_and_session(name: str, cfg):
     """
     Create transport + ClientSession for a given server config.
 
-    Returns (session, local_stack) where local_stack.aclose() must be called
-    when the session is no longer needed. Does NOT use the AgentLoop's stack.
+    Returns (session, local_stack) where local_stack.aclose() tears it down.
+    Does NOT use the AgentLoop's AsyncExitStack — manages its own lifecycle.
     """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
@@ -77,7 +91,6 @@ async def _create_transport_and_session(name: str, cfg):
         else:
             raise ValueError(f"MCP server '{name}': no command or url configured")
 
-    # Local stack — lifecycle managed independently of the AgentLoop's stack.
     local_stack = AsyncExitStack()
     await local_stack.__aenter__()
 
@@ -139,8 +152,8 @@ class MCPConnectionManager:
     on session death (server restart, stale session reaped, network error).
 
     The asyncio.Lock ensures that concurrent tool call failures trigger exactly
-    one reconnect. Coroutines waiting behind the lock see a fresh session and
-    proceed without reconnecting again (thundering-herd protection).
+    one reconnect (thundering-herd protection). Coroutines waiting behind the
+    lock see a fresh session and proceed without reconnecting again.
     """
 
     def __init__(self, name: str, cfg):
@@ -154,8 +167,8 @@ class MCPConnectionManager:
         """
         Initial connection — called once from connect_mcp_servers().
 
-        Uses the AgentLoop's AsyncExitStack so that normal shutdown (via aclose())
-        tears it down gracefully without needing special cleanup code.
+        Uses the AgentLoop's AsyncExitStack so that normal shutdown (aclose())
+        tears it down gracefully.
         """
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.sse import sse_client
@@ -227,12 +240,12 @@ class MCPConnectionManager:
         """
         Tear down dead session, establish a fresh one.
 
-        The asyncio.Lock prevents thundering herd: if 3 tools fail simultaneously,
-        only 1 reconnect executes. The other 2 wait behind the lock, see a fresh
-        self._session, and proceed.
+        The asyncio.Lock prevents thundering herd: if N tools fail simultaneously,
+        only 1 reconnect executes. The others wait behind the lock, then see a
+        fresh self._session and proceed without reconnecting again.
         """
         async with self._lock:
-            # Close the old local stack (if any prior reconnect left one)
+            # Close the previous local stack (from prior reconnect, if any)
             if self._local_stack is not None:
                 try:
                     await self._local_stack.aclose()
@@ -256,16 +269,15 @@ class MCPConnectionManager:
         self, tool_name: str, arguments: dict, timeout: int
     ) -> Any:
         """
-        Call a tool. On session death, reconnect once and retry.
+        Call a tool with reconnect-on-failure.
 
-        CancelledError from anyio internal cancel scopes is treated as a session-dead
-        condition: when the transport dies, anyio's write stream raises CancelledError
-        from its checkpoint(). We distinguish this from an external cancellation by
-        checking asyncio.current_task().cancelling() — if > 0, we're externally
-        cancelled and re-raise; otherwise treat as session dead.
+        On session death, reconnect once and retry. If the retry also fails,
+        propagate the exception so the caller can return an error to the LLM.
 
-        If the retry also fails, let the exception propagate so the caller can
-        log and return an error string to the LLM.
+        CancelledError handling:
+        - External task cancellation (e.g. /stop): task.cancelling() > 0 → re-raise
+        - anyio cancel-scope from transport death: message starts with
+          "Cancelled via cancel scope" → treat as session dead → reconnect
         """
         try:
             return await asyncio.wait_for(
@@ -274,13 +286,12 @@ class MCPConnectionManager:
             )
         except asyncio.TimeoutError:
             raise
-        except asyncio.CancelledError:
-            # If our asyncio task has been externally cancelled (e.g. /stop), re-raise.
+        except asyncio.CancelledError as exc:
+            # Re-raise if this task was externally cancelled (e.g. /stop command)
             task = asyncio.current_task()
-            if task is not None and task.cancelling() > 0:
+            if task is not None and task.cancelling() > 0 and not _is_anyio_cancel_scope_error(exc):
                 raise
-            # Otherwise this is an anyio cancel-scope leak from transport death.
-            # Fall through to reconnect below.
+            # Otherwise: anyio cancel scope from transport death — treat as session dead
             logger.warning(
                 "mcp_session_dead_cancelled",
                 server=self._name,
