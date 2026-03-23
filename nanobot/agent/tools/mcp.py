@@ -162,6 +162,7 @@ class MCPConnectionManager:
         self._session = None
         self._local_stack: AsyncExitStack | None = None
         self._lock = asyncio.Lock()
+        self._reconnect_count: int = 0  # incremented on each successful reconnect
 
     async def connect(self, stack: AsyncExitStack) -> None:
         """
@@ -236,15 +237,23 @@ class MCPConnectionManager:
         self._session = await stack.enter_async_context(ClientSession(read, write))
         await self._session.initialize()
 
-    async def reconnect(self) -> None:
+    async def reconnect(self, dead_at_count: int = -1) -> None:
         """
         Tear down dead session, establish a fresh one.
 
+        dead_at_count: value of _reconnect_count when session death was detected.
+        If _reconnect_count has changed since (another coroutine reconnected while
+        we waited for the lock), skip reconnect — just return with fresh session.
+
         The asyncio.Lock prevents thundering herd: if N tools fail simultaneously,
-        only 1 reconnect executes. The others wait behind the lock, then see a
-        fresh self._session and proceed without reconnecting again.
+        only 1 reconnect executes. The others wait behind the lock, see the count
+        has changed, and return immediately.
         """
         async with self._lock:
+            # Skip if another coroutine already reconnected while we waited
+            if dead_at_count >= 0 and self._reconnect_count != dead_at_count:
+                return
+
             # Close the previous local stack (from prior reconnect, if any)
             if self._local_stack is not None:
                 try:
@@ -263,6 +272,7 @@ class MCPConnectionManager:
             )
             self._session = session
             self._local_stack = local_stack
+            self._reconnect_count += 1
             logger.info("mcp_session_created", server=self._name)
 
     async def call_tool(
@@ -277,13 +287,13 @@ class MCPConnectionManager:
         CancelledError handling:
         - External task cancellation (e.g. /stop): task.cancelling() > 0
           AND NOT an anyio cancel-scope message → re-raise
-        - anyio cancel-scope from transport death: message starts with
-          "Cancelled via cancel scope" → treat as session dead → reconnect
+        - anyio cancel-scope from transport death: "Cancelled via cancel scope"
+          prefix → treat as session dead → reconnect
 
-        The reconnect is run via asyncio.shield() to protect it from any
-        pending task cancellation set by the anyio cancel scope. After
-        catching the anyio CancelledError we call task.uncancel() to
-        clear the pending cancellation count before proceeding.
+        Reconnect runs in a SEPARATE asyncio Task (via asyncio.create_task +
+        wait) because the anyio cancel scope from the dead session persists
+        inside the current task. Running reconnect in a new task means the
+        fresh session setup is unaffected by the old session's cancel scope.
         """
         try:
             return await asyncio.wait_for(
@@ -297,10 +307,7 @@ class MCPConnectionManager:
             task = asyncio.current_task()
             if task is not None and task.cancelling() > 0 and not _is_anyio_cancel_scope_error(exc):
                 raise
-            # anyio cancel scope from transport death — treat as session dead
-            # Uncancel to allow subsequent awaits (lock.acquire, reconnect) to proceed
-            if task is not None:
-                task.uncancel()
+            # anyio cancel scope from transport death
             logger.warning(
                 "mcp_session_dead_cancelled",
                 server=self._name,
@@ -316,9 +323,20 @@ class MCPConnectionManager:
                 error=str(exc),
             )
 
-        # Reconnect (shielded so a subsequent external cancel doesn't abort it)
-        # then retry once.
-        await asyncio.shield(self.reconnect())
+        # Reconnect in a separate asyncio Task so the dead session's anyio
+        # cancel scope cannot propagate into the new transport setup.
+        # dead_at_count ensures only 1 of N concurrent failures actually reconnects;
+        # the others skip (thundering herd protection via compare-and-skip in lock).
+        dead_at = self._reconnect_count
+        reconnect_task = asyncio.ensure_future(self.reconnect(dead_at))
+        try:
+            await asyncio.shield(reconnect_task)
+        except asyncio.CancelledError:
+            # Our task was externally cancelled. Let reconnect finish anyway
+            # (don't abort a half-initialized session), then re-raise.
+            await reconnect_task
+            raise
+
         return await asyncio.wait_for(
             self._session.call_tool(tool_name, arguments=arguments),
             timeout=timeout,
