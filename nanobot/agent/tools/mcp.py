@@ -275,9 +275,15 @@ class MCPConnectionManager:
         propagate the exception so the caller can return an error to the LLM.
 
         CancelledError handling:
-        - External task cancellation (e.g. /stop): task.cancelling() > 0 → re-raise
+        - External task cancellation (e.g. /stop): task.cancelling() > 0
+          AND NOT an anyio cancel-scope message → re-raise
         - anyio cancel-scope from transport death: message starts with
           "Cancelled via cancel scope" → treat as session dead → reconnect
+
+        The reconnect is run via asyncio.shield() to protect it from any
+        pending task cancellation set by the anyio cancel scope. After
+        catching the anyio CancelledError we call task.uncancel() to
+        clear the pending cancellation count before proceeding.
         """
         try:
             return await asyncio.wait_for(
@@ -291,7 +297,10 @@ class MCPConnectionManager:
             task = asyncio.current_task()
             if task is not None and task.cancelling() > 0 and not _is_anyio_cancel_scope_error(exc):
                 raise
-            # Otherwise: anyio cancel scope from transport death — treat as session dead
+            # anyio cancel scope from transport death — treat as session dead
+            # Uncancel to allow subsequent awaits (lock.acquire, reconnect) to proceed
+            if task is not None:
+                task.uncancel()
             logger.warning(
                 "mcp_session_dead_cancelled",
                 server=self._name,
@@ -307,8 +316,9 @@ class MCPConnectionManager:
                 error=str(exc),
             )
 
-        # Reconnect and retry once
-        await self.reconnect()
+        # Reconnect (shielded so a subsequent external cancel doesn't abort it)
+        # then retry once.
+        await asyncio.shield(self.reconnect())
         return await asyncio.wait_for(
             self._session.call_tool(tool_name, arguments=arguments),
             timeout=timeout,
