@@ -1,4 +1,4 @@
-"""Slack channel implementation using Socket Mode."""
+"""Slack channel implementation using Socket Mode and HTTP webhook."""
 
 import asyncio
 import re
@@ -46,7 +46,7 @@ class SlackConfig(Base):
 
 
 class SlackChannel(BaseChannel):
-    """Slack channel using Socket Mode."""
+    """Slack channel using Socket Mode and HTTP webhook."""
 
     name = "slack"
     display_name = "Slack"
@@ -62,26 +62,17 @@ class SlackChannel(BaseChannel):
         self.config: SlackConfig = config
         self._web_client: AsyncWebClient | None = None
         self._socket_client: SocketModeClient | None = None
+        self._http_runner: Any = None
         self._bot_user_id: str | None = None
 
     async def start(self) -> None:
-        """Start the Slack Socket Mode client."""
-        if not self.config.bot_token or not self.config.app_token:
-            logger.error("Slack bot/app token not configured")
-            return
-        if self.config.mode != "socket":
-            logger.error("Unsupported Slack mode: {}", self.config.mode)
+        """Start the Slack channel (Socket Mode or webhook)."""
+        if not self.config.bot_token:
+            logger.error("Slack bot token not configured")
             return
 
         self._running = True
-
         self._web_client = AsyncWebClient(token=self.config.bot_token)
-        self._socket_client = SocketModeClient(
-            app_token=self.config.app_token,
-            web_client=self._web_client,
-        )
-
-        self._socket_client.socket_mode_request_listeners.append(self._on_socket_request)
 
         # Resolve bot user ID for mention handling
         try:
@@ -91,11 +82,25 @@ class SlackChannel(BaseChannel):
         except Exception as e:
             logger.warning("Slack auth_test failed: {}", e)
 
-        logger.info("Starting Slack Socket Mode client...")
-        await self._socket_client.connect()
-
-        while self._running:
-            await asyncio.sleep(1)
+        if self.config.mode == "webhook":
+            await self._start_webhook_server()
+            while self._running:
+                await asyncio.sleep(1)
+        elif self.config.mode == "socket":
+            if not self.config.app_token:
+                logger.error("Slack app token required for socket mode")
+                return
+            self._socket_client = SocketModeClient(
+                app_token=self.config.app_token,
+                web_client=self._web_client,
+            )
+            self._socket_client.socket_mode_request_listeners.append(self._on_socket_request)
+            logger.info("Starting Slack Socket Mode client...")
+            await self._socket_client.connect()
+            while self._running:
+                await asyncio.sleep(1)
+        else:
+            logger.error("Unsupported Slack mode: {}", self.config.mode)
 
     async def stop(self) -> None:
         """Stop the Slack client."""
@@ -106,6 +111,9 @@ class SlackChannel(BaseChannel):
             except Exception as e:
                 logger.warning("Slack socket close failed: {}", e)
             self._socket_client = None
+        if self._http_runner:
+            await self._http_runner.cleanup()
+            self._http_runner = None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Slack."""
@@ -145,6 +153,94 @@ class SlackChannel(BaseChannel):
 
         except Exception as e:
             logger.error("Error sending Slack message: {}", e)
+
+    async def _start_webhook_server(self) -> None:
+        """Start an aiohttp HTTP server for webhook event receiving."""
+        from aiohttp import web
+
+        async def handle_slack_event(request: web.Request) -> web.Response:
+            try:
+                body = await request.json()
+            except Exception:
+                return web.Response(status=400, text="invalid json")
+
+            event = body.get("event") or {}
+            event_type = event.get("type")
+
+            if event_type not in ("message", "app_mention"):
+                return web.Response(text="ok")
+
+            sender_id = event.get("user")
+            chat_id = event.get("channel")
+
+            # Ignore bot/system messages
+            if event.get("subtype"):
+                return web.Response(text="ok")
+            if self._bot_user_id and sender_id == self._bot_user_id:
+                return web.Response(text="ok")
+
+            # Avoid double-processing mentions
+            text = event.get("text") or ""
+            if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
+                return web.Response(text="ok")
+
+            if not sender_id or not chat_id:
+                return web.Response(text="ok")
+
+            channel_type = event.get("channel_type") or ""
+
+            if not self._is_allowed(sender_id, chat_id, channel_type):
+                return web.Response(text="ok")
+
+            if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
+                return web.Response(text="ok")
+
+            text = self._strip_bot_mention(text)
+
+            thread_ts = event.get("thread_ts")
+            if self.config.reply_in_thread and not thread_ts:
+                thread_ts = event.get("ts")
+
+            # Add reaction (best-effort)
+            try:
+                if self._web_client and event.get("ts"):
+                    await self._web_client.reactions_add(
+                        channel=chat_id,
+                        name=self.config.react_emoji,
+                        timestamp=event.get("ts"),
+                    )
+            except Exception as e:
+                logger.debug("Slack reactions_add failed: {}", e)
+
+            session_key = f"slack:{chat_id}:{thread_ts}" if thread_ts and channel_type != "im" else None
+
+            try:
+                await self._handle_message(
+                    sender_id=sender_id,
+                    chat_id=chat_id,
+                    content=text,
+                    metadata={
+                        "slack": {
+                            "event": event,
+                            "thread_ts": thread_ts,
+                            "channel_type": channel_type,
+                        },
+                    },
+                    session_key=session_key,
+                )
+            except Exception:
+                logger.exception("Error handling Slack webhook event from {}", sender_id)
+
+            return web.Response(text="ok")
+
+        app = web.Application()
+        app.router.add_post(self.config.webhook_path, handle_slack_event)
+
+        self._http_runner = web.AppRunner(app)
+        await self._http_runner.setup()
+        site = web.TCPSite(self._http_runner, "0.0.0.0", 18790)
+        await site.start()
+        logger.info("Slack webhook server listening on :18790{}", self.config.webhook_path)
 
     async def _on_socket_request(
         self,
