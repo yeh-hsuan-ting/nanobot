@@ -19,6 +19,39 @@ _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", 
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
 
+# Terminal provider HTTP status codes — retrying will not help, so surface a
+# plain-language message instead of a raw exception string. Transient codes
+# (429, 5xx) are deliberately absent: they keep their raw error so
+# LLMProvider.chat_with_retry still recognises and retries them.
+_TERMINAL_STATUS_MESSAGES: dict[int, str] = {
+    402: (
+        "本週的 AI 使用額度已用完，請稍後再試或聯絡管理員。\n"
+        "(Your AI usage allowance for this period has been used up. "
+        "Please try again later or contact your administrator.)"
+    ),
+    401: (
+        "AI 服務金鑰無效或未設定，請聯絡管理員。\n"
+        "(The AI service key is invalid or missing. "
+        "Please contact your administrator.)"
+    ),
+    403: (
+        "AI 服務拒絕了這次請求，請聯絡管理員。\n"
+        "(The AI service refused this request. "
+        "Please contact your administrator.)"
+    ),
+}
+
+
+def _friendly_provider_error(exc: Exception) -> str | None:
+    """Map a terminal provider error to a user-facing message, else None."""
+    raw = getattr(exc, "status_code", None)
+    try:
+        status = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        status = None
+    return _TERMINAL_STATUS_MESSAGES.get(status) if status is not None else None
+
+
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
     return "".join(secrets.choice(_ALNUM) for _ in range(9))
@@ -281,9 +314,12 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
+            # Return error as content for graceful handling. Terminal provider
+            # errors (e.g. OpenRouter 402 credits/limit exhausted) get a
+            # user-facing message; transient errors keep the raw string so the
+            # retry layer in chat_with_retry can still recognise them.
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=_friendly_provider_error(e) or f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
 
