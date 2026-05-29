@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
+from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
 
 
 class ScriptedProvider(LLMProvider):
@@ -211,3 +211,105 @@ async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
         content = msg.get("content")
         if isinstance(content, list):
             assert any("[image omitted]" in (b.get("text") or "") for b in content)
+
+
+# ---------------------------------------------------------------------------
+# Empty-completion retry tests (HTTP-200 but no content and no tool calls)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_retries_then_succeeds(monkeypatch) -> None:
+    """A null/empty 200 completion is retried, not surfaced as a blank reply."""
+    provider = ScriptedProvider([
+        LLMResponse(content=None, finish_reason="length"),
+        LLMResponse(content="here are the products"),
+    ])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "列出所有商品"}])
+
+    assert response.content == "here are the products"
+    assert provider.calls == 2
+    assert delays == [1]
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_with_finish_none_is_retried(monkeypatch) -> None:
+    """Provider null completion (finish_reason None) also retries."""
+    provider = ScriptedProvider([
+        LLMResponse(content=None, finish_reason=None),
+        LLMResponse(content="recovered"),
+    ])
+
+    async def _fake_sleep(delay: int) -> None:
+        pass
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.content == "recovered"
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_completion_is_retried(monkeypatch) -> None:
+    """Content that is only whitespace is treated as empty and retried."""
+    provider = ScriptedProvider([
+        LLMResponse(content="\n\n  ", finish_reason="stop"),
+        LLMResponse(content="real answer"),
+    ])
+
+    async def _fake_sleep(delay: int) -> None:
+        pass
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.content == "real answer"
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_with_tool_calls_is_not_retried() -> None:
+    """An empty-text response that carries tool calls is valid — return it as-is."""
+    tool_call = ToolCallRequest(id="t1", name="mcp_waddy_search_products", arguments={"query": ""})
+    provider = ScriptedProvider([
+        LLMResponse(content=None, finish_reason="tool_calls", tool_calls=[tool_call]),
+    ])
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "列出所有商品"}])
+
+    assert provider.calls == 1
+    assert response.has_tool_calls
+    assert response.tool_calls[0].name == "mcp_waddy_search_products"
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_returns_blank_after_exhausting_retries(monkeypatch) -> None:
+    """If every attempt is empty, return the final (blank) response after retries."""
+    provider = ScriptedProvider([
+        LLMResponse(content=None, finish_reason="length"),
+        LLMResponse(content=None, finish_reason="length"),
+        LLMResponse(content=None, finish_reason="length"),
+        LLMResponse(content=None, finish_reason="length"),
+    ])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hi"}])
+
+    assert provider.calls == 4
+    assert delays == [1, 2, 4]
+    assert not (response.content and response.content.strip())

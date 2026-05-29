@@ -44,7 +44,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -193,6 +193,21 @@ class LLMProvider(ABC):
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
     @staticmethod
+    def _is_empty_completion(response: LLMResponse) -> bool:
+        """HTTP-200 but unusable: no text and no tool calls.
+
+        Some providers/reasoning models intermittently return this — a null
+        completion, or finish_reason 'length' from spending the whole token
+        budget on reasoning before emitting content. Treat as retryable so the
+        user gets an answer instead of a blank fallback reply.
+        """
+        if response.finish_reason == "error":
+            return False
+        if response.has_tool_calls:
+            return False
+        return not (response.content and response.content.strip())
+
+    @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Replace image_url blocks with text placeholder. Returns None if no images found."""
         found = False
@@ -256,6 +271,13 @@ class LLMProvider(ABC):
             response = await self._safe_chat(**kw)
 
             if response.finish_reason != "error":
+                if self._is_empty_completion(response):
+                    logger.warning(
+                        "LLM empty completion (attempt {}/{}, finish_reason={}), retrying in {}s",
+                        attempt, len(self._CHAT_RETRY_DELAYS), response.finish_reason, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 return response
 
             if not self._is_transient_error(response.content):
